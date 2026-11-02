@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Builds data/sealed-prices.json for the Binder app.
+Builds price files for the Binder app:
+  data/sealed-prices.json   (booster boxes, ETBs, ...)  needs CM_PRODUCT_LIST_URL
+  data/singles-prices.json  (single cards)              needs CM_SINGLES_LIST_URL
+Either one is optional; each is built only when its link is set.
 
 Downloads Cardmarket's Product List and Price Guide (JSON), keeps only
 non-single products (booster boxes, ETBs, bundles, ...) that have a price,
@@ -9,6 +12,7 @@ and writes one small file Binder can read from the browser.
 Configuration (environment variables, set as GitHub Actions "Variables"):
   CM_PRICE_GUIDE_URL   direct link to Cardmarket's Pokémon Price Guide file
   CM_PRODUCT_LIST_URL  direct link to Cardmarket's Pokémon Product List (non-singles) file
+  CM_SINGLES_LIST_URL  direct link to Cardmarket's Pokémon Product List (singles) file
 
 Standard library only. Fails loudly (non-zero exit) if nothing usable is found,
 so a broken run shows up as a red cross in the Actions tab instead of silently
@@ -20,21 +24,34 @@ import io
 import json
 import os
 import sys
+import urllib.parse
 import urllib.request
 import zipfile
 
-OUT_PATH = os.path.join("data", "sealed-prices.json")
+SEALED_PATH = os.path.join("data", "sealed-prices.json")
+SINGLES_PATH = os.path.join("data", "singles-prices.json")
+
+
+class JobError(Exception):
+    pass
 
 
 def fail(msg):
+    raise JobError(msg)
+
+
+def report(msg):
     print("ERROR: " + msg, file=sys.stderr)
-    sys.exit(1)
+    # "::error::" makes GitHub show the reason in the red box on the run page.
+    safe = msg.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print("::error title=Price update failed::" + safe)
 
 
 def fetch_json(url, label):
     if not url:
         fail(f"{label} is not set. Add it under Settings > Secrets and variables > Actions > Variables.")
-    print(f"Downloading {label} ...")
+    host = urllib.parse.urlparse(url).netloc or "(no host - is the link complete?)"
+    print(f"Downloading {label} from {host} ...")
     req = urllib.request.Request(url, headers={"User-Agent": "binder-sealed-prices/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=180) as resp:
@@ -77,26 +94,12 @@ def num(value):
     return v if v > 0 else None
 
 
-def main():
-    products_raw = extract_array(fetch_json(os.environ.get("CM_PRODUCT_LIST_URL"), "Product List"), "Product List")
-    guide_raw = extract_array(fetch_json(os.environ.get("CM_PRICE_GUIDE_URL"), "Price Guide"), "Price Guide")
-    print(f"Product List: {len(products_raw)} records, Price Guide: {len(guide_raw)} records")
-
-    if products_raw and "idProduct" not in products_raw[0]:
-        fail(f"Product List records have no 'idProduct'. Example record keys: {list(products_raw[0])}")
-    if guide_raw and "idProduct" not in guide_raw[0]:
-        fail(f"Price Guide records have no 'idProduct'. Example record keys: {list(guide_raw[0])}")
-
-    guide = {}
-    for rec in guide_raw:
-        guide[str(rec.get("idProduct"))] = rec
-
-    out = []
-    skipped_singles = 0
+def build_rows(products_raw, guide, skip_singles, label):
+    out, skipped = [], 0
     for rec in products_raw:
         category = str(rec.get("categoryName", "")).lower()
-        if "single" in category:
-            skipped_singles += 1
+        if skip_singles and "single" in category:
+            skipped += 1
             continue
         name = rec.get("name") or rec.get("enName") or rec.get("productName")
         pid = str(rec.get("idProduct"))
@@ -114,22 +117,70 @@ def main():
             "name": str(name),
             "trend": trend, "avg": avg, "low": low, "avg7": avg7, "avg30": avg30,
         })
+    print(f"{label}: kept {len(out)} priced products" + (f" (skipped {skipped} singles)" if skipped else ""))
+    return out
 
-    print(f"Kept {len(out)} priced non-single products (skipped {skipped_singles} singles)")
-    if not out:
-        fail("No priced non-single products found. Check that CM_PRODUCT_LIST_URL is the NON-singles "
-             "Product List and that the Price Guide covers sealed products.")
 
-    os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
+def write_feed(path, rows, source):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {
         "generatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-        "source": "Cardmarket Product List + Price Guide",
+        "source": source,
         "currency": "EUR",
-        "products": out,
+        "products": rows,
     }
-    with open(OUT_PATH, "w", encoding="utf-8") as fh:
+    with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, separators=(",", ":"))
-    print(f"Wrote {OUT_PATH} ({os.path.getsize(OUT_PATH) / 1024:.0f} KB)")
+    print(f"Wrote {path} ({os.path.getsize(path) / 1024:.0f} KB)")
+
+
+def load_products(url, label):
+    raw = extract_array(fetch_json(url, label), label)
+    if raw and "idProduct" not in raw[0]:
+        fail(f"{label} records have no 'idProduct'. Example record keys: {list(raw[0])}")
+    return raw
+
+
+def main():
+    sealed_url = os.environ.get("CM_PRODUCT_LIST_URL", "").strip()
+    singles_url = os.environ.get("CM_SINGLES_LIST_URL", "").strip()
+    if not sealed_url and not singles_url:
+        report("Nothing to do: set CM_PRODUCT_LIST_URL (sealed) and/or CM_SINGLES_LIST_URL (singles) "
+               "under Settings > Secrets and variables > Actions > Variables.")
+        sys.exit(1)
+
+    guide_url = os.environ.get("CM_PRICE_GUIDE_URL", "").strip()
+    try:
+        guide_raw = extract_array(fetch_json(guide_url, "Price Guide"), "Price Guide")
+        if guide_raw and "idProduct" not in guide_raw[0]:
+            fail(f"Price Guide records have no 'idProduct'. Example record keys: {list(guide_raw[0])}")
+    except JobError as exc:
+        report(str(exc))
+        sys.exit(1)
+    guide = {str(rec.get("idProduct")): rec for rec in guide_raw}
+    print(f"Price Guide: {len(guide_raw)} records")
+
+    errors = []
+    jobs = []
+    if sealed_url:
+        jobs.append(("Sealed", sealed_url, SEALED_PATH, True, "Cardmarket Product List + Price Guide",
+                     "Check that CM_PRODUCT_LIST_URL is the NON-singles Product List and that the Price Guide covers sealed products."))
+    if singles_url:
+        jobs.append(("Singles", singles_url, SINGLES_PATH, False, "Cardmarket Singles Product List + Price Guide",
+                     "Check that CM_SINGLES_LIST_URL is the SINGLES Product List."))
+    for label, url, path, skip_singles, source, hint in jobs:
+        try:
+            rows = build_rows(load_products(url, f"{label} Product List"), guide, skip_singles, label)
+            if not rows:
+                fail(f"{label}: no priced products found. {hint}")
+            write_feed(path, rows, source)
+        except JobError as exc:
+            errors.append(f"{label}: {exc}")
+
+    for e in errors:
+        report(e)
+    if errors:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
