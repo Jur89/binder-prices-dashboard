@@ -94,6 +94,9 @@ def num(value):
     return v if v > 0 else None
 
 
+EXTRA_KEYS = ("idExpansion", "expansionName", "expansion", "setName", "set", "number", "cardNumber", "rarity", "idMetacard")
+
+
 def build_rows(products_raw, guide, skip_singles, label):
     out, skipped = [], 0
     for rec in products_raw:
@@ -112,11 +115,16 @@ def build_rows(products_raw, guide, skip_singles, label):
         avg7, avg30 = num(g.get("avg7")), num(g.get("avg30"))
         if not any((trend, avg, low, avg30)):
             continue
-        out.append({
+        row = {
             "idProduct": int(pid) if pid.isdigit() else pid,
             "name": str(name),
             "trend": trend, "avg": avg, "low": low, "avg7": avg7, "avg30": avg30,
-        })
+        }
+        # Keep any set / number / rarity information Cardmarket provides, so Binder can tell printings apart.
+        for key in EXTRA_KEYS:
+            if rec.get(key) not in (None, ""):
+                row[key] = rec[key]
+        out.append(row)
     print(f"{label}: kept {len(out)} priced products" + (f" (skipped {skipped} singles)" if skipped else ""))
     return out
 
@@ -136,6 +144,8 @@ def write_feed(path, rows, source):
 
 def load_products(url, label):
     raw = extract_array(fetch_json(url, label), label)
+    if raw:
+        print(f"{label} sample record: {json.dumps(raw[0], ensure_ascii=False)[:400]}")
     if raw and "idProduct" not in raw[0]:
         fail(f"{label} records have no 'idProduct'. Example record keys: {list(raw[0])}")
     return raw
