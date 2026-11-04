@@ -7,7 +7,9 @@ Either one is optional; each is built only when its link is set.
 
 It also builds data/cards-catalog.json (every English card: name, set, number, rarity)
 from the public PokemonTCG data on GitHub. Binder uses it for the type-ahead card
-preview with images. A problem with the catalog is only a warning, never a red run.
+preview with images. It also builds data/card-prices.json (Cardmarket EUR price per
+exact card id) so adding and refreshing cards never depends on a live, slow API.
+Problems with the catalog or card prices are only warnings, never a red run.
 
 Downloads Cardmarket's Product List and Price Guide (JSON), keeps only
 non-single products (booster boxes, ETBs, bundles, ...) that have a price,
@@ -36,6 +38,9 @@ import zipfile
 SEALED_PATH = os.path.join("data", "sealed-prices.json")
 SINGLES_PATH = os.path.join("data", "singles-prices.json")
 CATALOG_PATH = os.path.join("data", "cards-catalog.json")
+PRICES_PATH = os.path.join("data", "card-prices.json")
+PRICE_API = os.environ.get("PRICE_API_URL", "https://api.pokemontcg.io/v2/cards")
+PRICE_TIME_BUDGET = int(os.environ.get("PRICE_TIME_BUDGET_MIN", "40")) * 60
 CATALOG_BASE = os.environ.get("CATALOG_BASE_URL", "https://raw.githubusercontent.com/PokemonTCG/pokemon-tcg-data/master").rstrip("/")
 
 
@@ -209,6 +214,72 @@ def build_catalog():
           + (f"; {len(failed)} sets skipped" if failed else ""))
 
 
+def price_page(page):
+    url = f"{PRICE_API}?pageSize=250&page={page}&orderBy=-set.releaseDate&select=id,cardmarket"
+    headers = {"User-Agent": "binder-card-prices/1.0"}
+    key = os.environ.get("POKEMONTCG_API_KEY", "").strip()
+    if key:
+        headers["X-Api-Key"] = key
+    last = None
+    for n in range(4):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=90) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            time.sleep(5 * (n + 1))
+    raise JobError(f"card price page {page} failed: {last}")
+
+
+def build_card_prices():
+    """Cardmarket EUR prices per exact card id: [trend, avg, avg30, avg7, low]. Newer sets first;
+    entries from earlier runs are kept, so an interrupted run never loses data."""
+    prices = {}
+    try:
+        with open(PRICES_PATH, encoding="utf-8") as fh:
+            prices = dict(json.load(fh).get("prices", {}))
+    except Exception:  # noqa: BLE001
+        pass
+    start, page, fetched, partial = time.time(), 1, 0, False
+    while True:
+        if time.time() - start > PRICE_TIME_BUDGET:
+            partial = True
+            break
+        try:
+            data = price_page(page)
+        except JobError as exc:
+            if not fetched and not prices:
+                raise
+            print(f"  stopped early: {exc}")
+            partial = True
+            break
+        cards = data.get("data") or []
+        if not cards:
+            break
+        for c in cards:
+            p = ((c.get("cardmarket") or {}).get("prices")) or {}
+            vals = [num(p.get(k)) for k in ("trendPrice", "averageSellPrice", "avg30", "avg7", "lowPrice")]
+            if c.get("id") and any(vals):
+                prices[c["id"]] = [round(v, 2) if v else None for v in vals]
+        fetched += len(cards)
+        total = data.get("totalCount") or 0
+        if len(cards) < 250 or (total and fetched >= total):
+            break
+        page += 1
+        time.sleep(0.5)
+    if not prices:
+        raise JobError("no card prices received")
+    os.makedirs(os.path.dirname(PRICES_PATH), exist_ok=True)
+    payload = {
+        "generatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "source": "pokemontcg.io (Cardmarket EUR)", "currency": "EUR", "partial": partial, "prices": prices,
+    }
+    with open(PRICES_PATH, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, separators=(",", ":"))
+    print(f"Wrote {PRICES_PATH}: {len(prices)} cards ({fetched} refreshed this run{', partial' if partial else ''}, "
+          f"{os.path.getsize(PRICES_PATH) / 1024:.0f} KB)")
+
+
 def main():
     sealed_url = os.environ.get("CM_PRODUCT_LIST_URL", "").strip()
     singles_url = os.environ.get("CM_SINGLES_LIST_URL", "").strip()
@@ -219,6 +290,11 @@ def main():
             # Only a warning: the price feeds below still run and the run stays green.
             print(f"::warning title=Card catalog not updated::{exc}")
             print(f"WARNING: card catalog not updated: {exc}")
+        try:
+            build_card_prices()
+        except JobError as exc:
+            print(f"::warning title=Card prices not updated::{exc}")
+            print(f"WARNING: card prices not updated: {exc}")
     if not sealed_url and not singles_url:
         report("Nothing to do: set CM_PRODUCT_LIST_URL (sealed) and/or CM_SINGLES_LIST_URL (singles) "
                "under Settings > Secrets and variables > Actions > Variables.")
