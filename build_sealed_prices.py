@@ -40,6 +40,7 @@ SINGLES_PATH = os.path.join("data", "singles-prices.json")
 CATALOG_PATH = os.path.join("data", "cards-catalog.json")
 PRICES_PATH = os.path.join("data", "card-prices.json")
 PRICE_API = os.environ.get("PRICE_API_URL", "https://api.pokemontcg.io/v2/cards")
+PRICE_PAGE = int(os.environ.get("PRICE_PAGE_SIZE", "100"))
 PRICE_TIME_BUDGET = int(os.environ.get("PRICE_TIME_BUDGET_MIN", "40")) * 60
 CATALOG_BASE = os.environ.get("CATALOG_BASE_URL", "https://raw.githubusercontent.com/PokemonTCG/pokemon-tcg-data/master").rstrip("/")
 
@@ -215,20 +216,21 @@ def build_catalog():
 
 
 def price_page(page):
-    url = f"{PRICE_API}?pageSize=250&page={page}&orderBy=-set.releaseDate&select=id,cardmarket"
+    url = f"{PRICE_API}?pageSize={PRICE_PAGE}&page={page}&orderBy=-set.releaseDate&select=id,cardmarket"
     headers = {"User-Agent": "binder-card-prices/1.0"}
     key = os.environ.get("POKEMONTCG_API_KEY", "").strip()
     if key:
         headers["X-Api-Key"] = key
     last = None
-    for n in range(4):
+    for n in range(6):
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=90) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except Exception as exc:  # noqa: BLE001
             last = exc
-            time.sleep(5 * (n + 1))
-    raise JobError(f"card price page {page} failed: {last}")
+            print(f"  page {page} attempt {n + 1} failed: {exc}")
+            time.sleep(8 * (n + 1))          # their server returns 5xx errors now and then: wait and retry
+    raise JobError(f"card price page {page} failed after 6 tries: {last}")
 
 
 def build_card_prices():
@@ -263,7 +265,7 @@ def build_card_prices():
                 prices[c["id"]] = [round(v, 2) if v else None for v in vals]
         fetched += len(cards)
         total = data.get("totalCount") or 0
-        if len(cards) < 250 or (total and fetched >= total):
+        if len(cards) < PRICE_PAGE or (total and fetched >= total):
             break
         page += 1
         time.sleep(0.5)
