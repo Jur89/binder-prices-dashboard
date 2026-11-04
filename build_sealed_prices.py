@@ -5,6 +5,10 @@ Builds price files for the Binder app:
   data/singles-prices.json  (single cards)              needs CM_SINGLES_LIST_URL
 Either one is optional; each is built only when its link is set.
 
+It also builds data/cards-catalog.json (every English card: name, set, number, rarity)
+from the public PokemonTCG data on GitHub. Binder uses it for the type-ahead card
+preview with images. A problem with the catalog is only a warning, never a red run.
+
 Downloads Cardmarket's Product List and Price Guide (JSON), keeps only
 non-single products (booster boxes, ETBs, bundles, ...) that have a price,
 and writes one small file Binder can read from the browser.
@@ -24,12 +28,15 @@ import io
 import json
 import os
 import sys
+import time
 import urllib.parse
 import urllib.request
 import zipfile
 
 SEALED_PATH = os.path.join("data", "sealed-prices.json")
 SINGLES_PATH = os.path.join("data", "singles-prices.json")
+CATALOG_PATH = os.path.join("data", "cards-catalog.json")
+CATALOG_BASE = os.environ.get("CATALOG_BASE_URL", "https://raw.githubusercontent.com/PokemonTCG/pokemon-tcg-data/master").rstrip("/")
 
 
 class JobError(Exception):
@@ -151,9 +158,67 @@ def load_products(url, label):
     return raw
 
 
+def http_json(url, label, attempts=3):
+    last = None
+    for n in range(attempts):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "binder-catalog/1.0"})
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return json.loads(resp.read().decode("utf-8-sig"))
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            time.sleep(2 * (n + 1))
+    raise JobError(f"Could not download {label}: {last}")
+
+
+def build_catalog():
+    """Compact list of every English card: sets + [id, name, number, setIndex, rarity]."""
+    sets_raw = http_json(f"{CATALOG_BASE}/sets/en.json", "card sets")
+    if not isinstance(sets_raw, list) or not sets_raw:
+        raise JobError("card sets file is empty or has an unexpected layout")
+    sets_raw.sort(key=lambda s: str(s.get("releaseDate", "")))
+    sets, cards, failed = [], [], []
+    for s in sets_raw:
+        sid = s.get("id")
+        if not sid:
+            continue
+        try:
+            raw = http_json(f"{CATALOG_BASE}/cards/en/{sid}.json", f"cards of set {sid}", attempts=2)
+        except JobError as exc:
+            failed.append(sid)
+            print(f"  skipped set {sid}: {exc}")
+            continue
+        idx = len(sets)
+        sets.append([sid, s.get("name", sid), s.get("printedTotal") or s.get("total") or 0,
+                     str(s.get("releaseDate", "")).replace("/", "-")])
+        for c in raw:
+            if c.get("id") and c.get("name") and c.get("number") is not None:
+                cards.append([c["id"], c["name"], str(c["number"]), idx, c.get("rarity", "")])
+    if not cards:
+        raise JobError("no cards found in the catalog source")
+    os.makedirs(os.path.dirname(CATALOG_PATH), exist_ok=True)
+    payload = {
+        "generatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "source": "PokemonTCG/pokemon-tcg-data",
+        "sets": sets,
+        "cards": cards,
+    }
+    with open(CATALOG_PATH, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, separators=(",", ":"))
+    print(f"Wrote {CATALOG_PATH}: {len(cards)} cards in {len(sets)} sets ({os.path.getsize(CATALOG_PATH) / 1024:.0f} KB)"
+          + (f"; {len(failed)} sets skipped" if failed else ""))
+
+
 def main():
     sealed_url = os.environ.get("CM_PRODUCT_LIST_URL", "").strip()
     singles_url = os.environ.get("CM_SINGLES_LIST_URL", "").strip()
+    if os.environ.get("SKIP_CATALOG", "").strip() != "1":
+        try:
+            build_catalog()
+        except JobError as exc:
+            # Only a warning: the price feeds below still run and the run stays green.
+            print(f"::warning title=Card catalog not updated::{exc}")
+            print(f"WARNING: card catalog not updated: {exc}")
     if not sealed_url and not singles_url:
         report("Nothing to do: set CM_PRODUCT_LIST_URL (sealed) and/or CM_SINGLES_LIST_URL (singles) "
                "under Settings > Secrets and variables > Actions > Variables.")
